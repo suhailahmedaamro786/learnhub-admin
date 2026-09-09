@@ -1,0 +1,18 @@
+# Streamlit secrets (never commit real credentials; keep the .example)
+.streamlit/secrets.toml
+
+# Python
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
