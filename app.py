@@ -670,9 +670,55 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # -------------------------
+    # Secure admin login gate
+    # -------------------------
+    ADMIN_USERNAME = st.secrets.get("ADMIN_USERNAME", "aamrosk519@gmail.com")
+    ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "#Suhail#12")
+
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        st.markdown(
+            """
+            <div style='display:flex; justify-content:center; align-items:center; padding-top:40px;'>
+              <div style='width:520px; border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:24px; background:rgba(255,255,255,0.03);'>
+                <h2 style='margin-bottom:4px;'>Admin Login</h2>
+                <p style='margin-top:0; opacity:0.8;'>Please sign in to access the dashboard.</p>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.form("login_form"):
+            identity = st.text_input("Email / Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", type="primary")
+
+        if submitted:
+            if identity == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Invalid email or password")
+
+        st.stop()
+
+    # Logout button when authenticated
+    with st.sidebar:
+        if st.button("Logout", type="secondary"):
+            st.session_state["authenticated"] = False
+            st.rerun()
+
     client = get_supabase()
     if client is None:
         st.stop()
+
+    # -------------------------
+    # Admin modules navigation
+    # -------------------------
 
     menu = st.sidebar.radio(
         "Modules",
@@ -699,3 +745,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
