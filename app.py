@@ -1,25 +1,38 @@
-"""
+"""apps/admin/app.py
+
 LearnHub — Streamlit Admin Dashboard
 ====================================
-Manage institute branding, faculty, courses, admissions, notifications and view
-analytics backed by Supabase (service-role key — server-side only).
+Secure Streamlit admin dashboard backed by Supabase.
 
-Credentials are read from environment variables first, then Streamlit
-secrets. Provide:
-    SUPABASE_URL
-    SUPABASE_SERVICE_ROLE_KEY
+Groq-powered subagents are integrated via `apps/admin/subagents.py`.
+All Groq calls are triggered ONLY by explicit button clicks.
+
+Auth:
+- Streamlit Secrets (fallback defaults)
 """
+
+from __future__ import annotations
 
 import os
 import time
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
 from supabase import create_client
 
+from subagents import (
+    MODEL_NAME,
+    analytics_agent,
+    course_content_creator,
+    publish_course_to_supabase,
+    support_lead_assistant,
+    get_groq_client,
+)
+
 # ----------------------------------------------------------------------
-# Configuration & client
+# Configuration & Supabase client
 # ----------------------------------------------------------------------
 
 TABLES = {
@@ -28,6 +41,7 @@ TABLES = {
     "notifications": "notifications",
     "profiles": "profiles",
     "support_tickets": "support_tickets",
+    "support_messages": "support_messages",
     "system_settings": "system_settings",
     "teachers": "teachers",
 }
@@ -37,20 +51,23 @@ STORAGE_BUCKET = "media"
 
 def get_supabase():
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get(
+        "SUPABASE_SERVICE_ROLE_KEY", ""
+    )
+
     if not url or not key:
         st.error(
             "Missing credentials. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY "
             "as environment variables or in Streamlit secrets."
         )
         return None
+
     return create_client(url, key)
 
 
-def query(client, table: str):
-    """Run a full select and return a DataFrame (or empty on error)."""
+def query_df(client, table: str, select: str = "*") -> pd.DataFrame:
     try:
-        res = client.table(table).select("*").execute()
+        res = client.table(table).select(select).execute()
         return pd.DataFrame(res.data or [])
     except Exception as exc:  # pragma: no cover
         st.error(f"Query failed on `{table}`: {exc}")
@@ -58,12 +75,9 @@ def query(client, table: str):
 
 
 def upload_media(client, file_obj, folder: str = "uploads") -> str:
-    """
-    Upload an uploaded file object directly to Supabase Storage bucket 'media'
-    and return the public URL.
-    """
     if file_obj is None:
         return ""
+
     try:
         file_bytes = file_obj.getvalue()
         file_ext = file_obj.name.split(".")[-1].lower() if "." in file_obj.name else "png"
@@ -71,39 +85,94 @@ def upload_media(client, file_obj, folder: str = "uploads") -> str:
         file_path = f"{folder}/{timestamp}_{file_obj.name}"
         content_type = file_obj.type or f"image/{file_ext}"
 
-        # Upload file bytes to Supabase storage
         client.storage.from_(STORAGE_BUCKET).upload(
             path=file_path,
             file=file_bytes,
             file_options={"content-type": content_type, "upsert": "true"},
         )
 
-        # Get the public URL
-        res = client.storage.from_(STORAGE_BUCKET).get_public_url(file_path)
-        return res
+        return client.storage.from_(STORAGE_BUCKET).get_public_url(file_path)
     except Exception as exc:
-        st.error(f"Storage upload error: {exc}. If bucket '{STORAGE_BUCKET}' does not exist, create it as Public in Supabase Storage dashboard.")
+        st.error(
+            f"Storage upload error: {exc}. "
+            f"If bucket '{STORAGE_BUCKET}' does not exist, create it as Public."
+        )
         return ""
 
 
 # ----------------------------------------------------------------------
-# Analytics
+# Security: Admin login gate
 # ----------------------------------------------------------------------
+
+ADMIN_USERNAME = st.secrets.get("ADMIN_USERNAME", "aamrosk519@gmail.com")
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "#Suhail#12")
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+st.set_page_config(page_title="LearnHub Admin", page_icon="🎓", layout="wide")
+st.markdown(
+    "<h1 style='margin-bottom:0'>🎓 LearnHub <span style='color:#6366F1'>Admin</span></h1>",
+    unsafe_allow_html=True,
+)
+
+if not st.session_state["authenticated"]:
+    st.markdown(
+        """
+        <div style='display:flex; justify-content:center; align-items:center; padding-top:40px;'>
+          <div style='width:520px; border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:24px; background:rgba(255,255,255,0.03);'>
+            <h2 style='margin-bottom:4px;'>Admin Login</h2>
+            <p style='margin-top:0; opacity:0.8;'>Please sign in to access the dashboard.</p>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("login_form"):
+        identity = st.text_input("Email / Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", type="primary")
+
+    if submitted:
+        if identity == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Invalid email or password")
+
+    st.stop()
+
+# Logout button
+with st.sidebar:
+    if st.button("Logout", type="secondary"):
+        st.session_state["authenticated"] = False
+        st.rerun()
+
+
+# ----------------------------------------------------------------------
+# Modules (Analytics / Branding / Faculty / Courses / Admissions)
+# ----------------------------------------------------------------------
+
 
 def render_analytics(client):
     st.subheader("Analytics Overview")
 
-    students = query(client, "profiles")
-    active_courses = query(client, "courses")
-    admission_rows = query(client, "admissions")
-    tickets = query(client, "support_tickets")
+    profiles = query_df(client, "profiles")
+    courses = query_df(client, "courses")
+    admissions = query_df(client, "admissions")
+    tickets = query_df(client, "support_tickets")
 
-    student_count = len(students[students.get("role") == "student"]) if not students.empty and "role" in students.columns else len(students)
-    admission_count = len(admission_rows)
+    student_count = (
+        len(profiles[profiles.get("role") == "student"])
+        if not profiles.empty and "role" in profiles.columns
+        else len(profiles)
+    )
+    admission_count = len(admissions)
     courses_active = (
-        len(active_courses[active_courses.get("status") == "published"])
-        if not active_courses.empty and "status" in active_courses.columns
-        else len(active_courses)
+        len(courses[courses.get("status") == "published"])
+        if not courses.empty and "status" in courses.columns
+        else len(courses)
     )
     open_tickets = (
         len(tickets[tickets.get("status").isin(["open", "in_progress"])])
@@ -118,528 +187,404 @@ def render_analytics(client):
     c4.metric("Open Support Tickets", open_tickets)
 
     col_l, col_r = st.columns(2)
-
-    # Admissions distribution (pie)
     with col_l:
-        if not admission_rows.empty and "status" in admission_rows.columns:
-            dist = admission_rows["status"].value_counts().reset_index()
+        if not admissions.empty and "status" in admissions.columns:
+            dist = admissions["status"].value_counts().reset_index()
             dist.columns = ["status", "count"]
             fig = go.Figure(
                 go.Pie(
                     labels=dist["status"],
                     values=dist["count"],
                     hole=0.45,
-                    marker=dict(colors=["#6366F1", "#8B5CF6", "#10B981", "#F43F5E", "#F59E0B"]),
                 )
             )
-            fig.update_layout(
-                title="Admissions by status",
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#E2E8F0"),
-                height=360,
-            )
+            fig.update_layout(template="plotly_dark", height=360)
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No admissions data yet.")
 
-    # Course pricing (bar)
     with col_r:
-        if not active_courses.empty and "title" in active_courses.columns and "price" in active_courses.columns:
-            bar = active_courses[["title", "price"]].dropna()
+        if not courses.empty and "title" in courses.columns and "price" in courses.columns:
+            bar = courses[["title", "price"]].dropna()
             fig = go.Figure(
                 go.Bar(
                     x=bar["title"].astype(str),
                     y=bar["price"],
                     marker_color="#6366F1",
-                    hovertemplate="%{x}<br>$%{y:.2f}<extra></extra>",
                 )
             )
-            fig.update_layout(
-                title="Course pricing",
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#E2E8F0"),
-                xaxis=dict(tickangle=-30),
-                height=360,
-            )
+            fig.update_layout(template="plotly_dark", height=360)
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No courses to display pricing.")
 
 
-# ----------------------------------------------------------------------
-# Institute branding
-# ----------------------------------------------------------------------
-
 def render_branding(client):
     st.subheader("Institute Branding")
+    rows = query_df(client, "system_settings")
 
-    rows = query(client, "system_settings")
     if rows.empty:
-        st.warning("No `system_settings` row found. Creating default settings row...")
-        if st.button("Initialize system settings"):
-            try:
-                client.table("system_settings").insert({
-                    "id": 1,
-                    "institute_name": "LearnHub",
-                    "footer_text": "© LearnHub. All rights reserved.",
-                    "contact_email": "admin@learnhub.com",
-                }).execute()
-                st.success("System settings initialized.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Failed to initialize: {exc}")
+        st.warning("No `system_settings` row found.")
         return
 
     settings = rows.iloc[0].to_dict()
 
     with st.form("branding_form"):
-        institute_name = st.text_input("Institute name", value=settings.get("institute_name") or "")
-        footer_text = st.text_input("Footer text", value=settings.get("footer_text") or "")
-        contact_email = st.text_input("Contact email", value=settings.get("contact_email") or "")
+        institute_name = st.text_input(
+            "Institute name", value=settings.get("institute_name") or ""
+        )
+        footer_text = st.text_input(
+            "Footer text", value=settings.get("footer_text") or ""
+        )
+        contact_email = st.text_input(
+            "Contact email", value=settings.get("contact_email") or ""
+        )
         submitted = st.form_submit_button("Save branding", type="primary")
 
     if submitted:
         try:
-            client.table("system_settings").update({
-                "institute_name": institute_name,
-                "footer_text": footer_text,
-                "contact_email": contact_email,
-            }).eq("id", settings.get("id", 1)).execute()
+            client.table("system_settings").update(
+                {
+                    "institute_name": institute_name,
+                    "footer_text": footer_text,
+                    "contact_email": contact_email,
+                }
+            ).eq("id", settings.get("id", 1)).execute()
             st.success("Branding updated.")
+            st.rerun()
         except Exception as exc:  # pragma: no cover
             st.error(f"Update failed: {exc}")
 
 
-# ----------------------------------------------------------------------
-# Faculty management (CRUD + File Upload)
-# ----------------------------------------------------------------------
-
 def render_faculty(client):
     st.subheader("Faculty Management")
-    df = query(client, "teachers")
+    df = query_df(client, "teachers")
 
-    tab_view, tab_add = st.tabs(["View / Edit / Delete", "Add New Teacher"])
-
-    # Determine image field in table (avatar_url or image_url)
-    img_col = "avatar_url" if (not df.empty and "avatar_url" in df.columns) else "image_url"
+    tab_view, tab_add = st.tabs(["View / Edit / Delete", "Add new teacher"])
 
     with tab_view:
         if df.empty:
-            st.info("No teachers found.")
-        else:
-            cols_to_show = [c for c in ["id", "name", "role", "subject", "bio", img_col] if c in df.columns]
-            st.dataframe(df[cols_to_show], use_container_width=True, hide_index=True)
+            st.info("No teachers yet.")
+            return
 
-            st.divider()
-            teachers_by_id = df.set_index("id").to_dict("index")
-            pick = st.selectbox(
-                "Select teacher to edit",
-                options=list(teachers_by_id.keys()),
-                format_func=lambda i: f"{teachers_by_id[i].get('name', 'Unnamed')} (id {i})",
+        view_cols = [
+            c for c in ["id", "name", "role", "subject", "bio", "avatar_url", "image_url"] if c in df.columns
+        ]
+        st.dataframe(df[view_cols], use_container_width=True, hide_index=True)
+
+        teachers_by_id = df.set_index("id").to_dict("index")
+        pick = st.selectbox(
+            "Select teacher to edit",
+            options=list(teachers_by_id.keys()),
+            format_func=lambda i: f"{teachers_by_id[i].get('name')} (id {i})",
+        )
+        row = teachers_by_id[pick]
+
+        img_col = "avatar_url" if "avatar_url" in row else "image_url"
+        current_img = row.get(img_col) or ""
+        if current_img:
+            st.image(current_img, caption="Current Photo", width=120)
+
+        with st.form("edit_teacher"):
+            name = st.text_input("Name", value=row.get("name") or "")
+            role = st.text_input("Role", value=row.get("role") or "")
+            subject = st.text_input("Subject", value=row.get("subject") or "")
+            bio = st.text_area("Bio", value=row.get("bio") or "")
+            uploaded_file = st.file_uploader(
+                "Upload New Photo (JPG, PNG, WEBP)",
+                type=["jpg", "jpeg", "png", "webp"],
             )
-            row = teachers_by_id[pick]
+            fallback_img_url = st.text_input("Or Image URL (Fallback)", value=current_img)
+            save = st.form_submit_button("Update teacher", type="primary")
+            delete = st.form_submit_button("Delete teacher")
 
-            current_img = row.get(img_col) or row.get("avatar_url") or row.get("image_url") or ""
-            if current_img:
-                st.image(current_img, caption="Current Photo", width=120)
+        if save:
+            final_img_url = (fallback_img_url or "").strip() or None
+            if uploaded_file is not None:
+                with st.spinner("Uploading image..."):
+                    uploaded_url = upload_media(client, uploaded_file, folder="teachers")
+                    if uploaded_url:
+                        final_img_url = uploaded_url
 
-            with st.form("edit_teacher"):
-                name = st.text_input("Name", value=row.get("name") or "")
-                role = st.text_input("Role", value=row.get("role") or "")
-                subject = st.text_input("Subject", value=row.get("subject") or "")
-                bio = st.text_area("Bio", value=row.get("bio") or "")
+            payload = {
+                "name": name,
+                "role": role,
+                "subject": subject,
+                "bio": bio,
+                "avatar_url": final_img_url,
+                "image_url": final_img_url,
+            }
+            try:
+                client.table("teachers").update(payload).eq("id", pick).execute()
+            except Exception:
+                payload.pop("image_url", None)
+                client.table("teachers").update(payload).eq("id", pick).execute()
 
-                uploaded_file = st.file_uploader(
-                    "Upload New Photo (JPG, PNG, WEBP)",
-                    type=["jpg", "jpeg", "png", "webp"],
-                    key=f"teacher_edit_file_{pick}",
-                )
-                manual_img_url = st.text_input(
-                    "Or Image URL (Fallback)",
-                    value=current_img,
-                    help="Will be used if no new file is uploaded.",
-                )
+            st.success("Teacher updated.")
+            st.rerun()
 
-                c_save, c_del = st.columns([1, 1])
-                with c_save:
-                    save = st.form_submit_button("Update teacher", type="primary", use_container_width=True)
-                with c_del:
-                    delete = st.form_submit_button("Delete teacher", use_container_width=True)
-
-            if save:
-                final_img_url = manual_img_url
-                if uploaded_file is not None:
-                    with st.spinner("Uploading image to media bucket..."):
-                        uploaded_url = upload_media(client, uploaded_file, folder="teachers")
-                        if uploaded_url:
-                            final_img_url = uploaded_url
-
-                update_payload = {
-                    "name": name,
-                    "role": role,
-                    "subject": subject,
-                    "bio": bio,
-                    "avatar_url": final_img_url,
-                    "image_url": final_img_url,
-                }
-                # Filter to columns that exist if known, or send standard
-                try:
-                    client.table("teachers").update(update_payload).eq("id", pick).execute()
-                    st.success("Teacher updated.")
-                    st.rerun()
-                except Exception as exc:
-                    # Retry with avatar_url only if image_url column doesn't exist
-                    try:
-                        update_payload.pop("image_url", None)
-                        client.table("teachers").update(update_payload).eq("id", pick).execute()
-                        st.success("Teacher updated.")
-                        st.rerun()
-                    except Exception as e2:
-                        st.error(f"Update failed: {e2}")
-
-            if delete:
-                try:
-                    client.table("teachers").delete().eq("id", pick).execute()
-                    st.success("Teacher deleted.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Delete failed: {exc}")
+        if delete:
+            client.table("teachers").delete().eq("id", pick).execute()
+            st.success("Teacher deleted.")
+            st.rerun()
 
     with tab_add:
         with st.form("add_teacher"):
             name = st.text_input("Name *")
-            role = st.text_input("Role (e.g. Senior Instructor)")
-            subject = st.text_input("Subject (e.g. Full Stack Development)")
+            role = st.text_input("Role")
+            subject = st.text_input("Subject")
             bio = st.text_area("Bio")
-
             uploaded_file = st.file_uploader(
                 "Upload Photo (JPG, PNG, WEBP)",
                 type=["jpg", "jpeg", "png", "webp"],
-                key="teacher_add_file",
             )
             fallback_img_url = st.text_input("Or Image URL (Fallback)")
-
             submitted = st.form_submit_button("Add Teacher", type="primary")
 
         if submitted:
             if not name.strip():
                 st.warning("Name is required.")
-            else:
-                final_img_url = fallback_img_url.strip() or None
-                if uploaded_file is not None:
-                    with st.spinner("Uploading image to media bucket..."):
-                        uploaded_url = upload_media(client, uploaded_file, folder="teachers")
-                        if uploaded_url:
-                            final_img_url = uploaded_url
+                return
 
-                insert_payload = {
-                    "name": name.strip(),
-                    "role": role.strip() or None,
-                    "subject": subject.strip() or None,
-                    "bio": bio.strip() or None,
-                    "avatar_url": final_img_url,
-                    "image_url": final_img_url,
-                }
-                try:
-                    client.table("teachers").insert(insert_payload).execute()
-                    st.success("Teacher added successfully.")
-                    st.rerun()
-                except Exception as exc:
-                    # Retry without image_url if schema only has avatar_url
-                    try:
-                        insert_payload.pop("image_url", None)
-                        client.table("teachers").insert(insert_payload).execute()
-                        st.success("Teacher added successfully.")
-                        st.rerun()
-                    except Exception as e2:
-                        st.error(f"Failed to add teacher: {e2}")
+            final_img_url = fallback_img_url.strip() or None
+            if uploaded_file is not None:
+                with st.spinner("Uploading image..."):
+                    uploaded_url = upload_media(client, uploaded_file, folder="teachers")
+                    if uploaded_url:
+                        final_img_url = uploaded_url
+
+            payload = {
+                "name": name.strip(),
+                "role": role.strip() or None,
+                "subject": subject.strip() or None,
+                "bio": bio.strip() or None,
+                "avatar_url": final_img_url,
+                "image_url": final_img_url,
+            }
+            try:
+                client.table("teachers").insert(payload).execute()
+            except Exception:
+                payload.pop("image_url", None)
+                client.table("teachers").insert(payload).execute()
+
+            st.success("Teacher added successfully.")
+            st.rerun()
 
 
-# ----------------------------------------------------------------------
-# Course management (CRUD + File Upload)
-# ----------------------------------------------------------------------
+def _course_price_pkr(v: Any) -> str:
+    try:
+        num = float(v)
+        return f"PKR {num:,.0f}" if num.is_integer() else f"PKR {num:,.2f}"
+    except Exception:
+        return "PKR 0"
 
-def render_courses(client):
+
+def render_courses_horizontal(client):
     st.subheader("Course Management")
 
-    courses_df = query(client, "courses")
-    teachers_df = query(client, "teachers")
+    courses = query_df(client, "courses")
+    teachers = query_df(client, "teachers")
 
-    tab_view, tab_add = st.tabs(["View / Edit / Delete Courses", "Add New Course"])
+    teacher_lookup: Dict[Any, Dict[str, Any]] = {}
+    if not teachers.empty and "id" in teachers.columns:
+        teacher_lookup = teachers.set_index("id").to_dict("index")
 
-    # Prepare teachers lookup
-    teacher_options = {}
-    if not teachers_df.empty and "id" in teachers_df.columns:
-        for _, t in teachers_df.iterrows():
-            label = f"{t.get('name', 'Teacher')} ({t.get('subject') or 'General'})"
-            teacher_options[t["id"]] = label
+    if courses.empty:
+        st.info("No courses found.")
+        return
 
-    thumb_col = "thumbnail_url" if (not courses_df.empty and "thumbnail_url" in courses_df.columns) else "image_url"
+    # Normalize column fallbacks
+    def get_col(row, *cols):
+        for c in cols:
+            if c in row and row.get(c) not in [None, ""]:
+                return row.get(c)
+        return None
 
-    with tab_view:
-        if courses_df.empty:
-            st.info("No courses created yet.")
-        else:
-            cols_to_show = [c for c in ["id", "title", "category", "price", "duration_weeks", "status", "teacher_id", thumb_col] if c in courses_df.columns]
-            st.dataframe(courses_df[cols_to_show], use_container_width=True, hide_index=True)
+    # Cards
+    for _, r in courses.iterrows():
+        course_id = r.get("id")
+        title = get_col(r, "title") or "Untitled course"
+        description = get_col(r, "description") or ""
+        price = r.get("price")
+        duration = r.get("duration_weeks") or r.get("duration")
+        status = (str(get_col(r, "status") or "draft")).lower()
+        badge = "Published" if status in ["published", "active"] else "Draft"
 
-            st.divider()
-            courses_by_id = courses_df.set_index("id").to_dict("index")
-            pick_id = st.selectbox(
-                "Select course to edit",
-                options=list(courses_by_id.keys()),
-                format_func=lambda i: f"{courses_by_id[i].get('title', 'Untitled')} (ID: {i})",
-            )
-            course_row = courses_by_id[pick_id]
+        thumb = get_col(r, "thumbnail_url", "image_url")
 
-            current_img = course_row.get(thumb_col) or course_row.get("thumbnail_url") or course_row.get("image_url") or ""
-            if current_img:
-                st.image(current_img, caption="Course Thumbnail", width=220)
+        teacher_id = r.get("teacher_id")
+        instructor_name = None
+        if teacher_id in teacher_lookup:
+            instructor_name = teacher_lookup[teacher_id].get("name") or teacher_lookup[teacher_id].get("designation")
+        instructor_name = instructor_name or r.get("instructor") or ""
 
-            with st.form("edit_course_form"):
-                title = st.text_input("Title *", value=course_row.get("title") or "")
-                description = st.text_area("Description", value=course_row.get("description") or "")
-                category = st.text_input("Category", value=course_row.get("category") or "Development")
+        st.markdown("---")
+        c_img, c_mid, c_right = st.columns([1, 4, 2])
 
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    price_val = float(course_row.get("price") or 0.0)
-                    price = st.number_input("Price ($)", min_value=0.0, step=5.0, value=price_val)
-                with c2:
-                    dur_val = int(course_row.get("duration_weeks") or 4)
-                    duration = st.number_input("Duration (Weeks)", min_value=1, step=1, value=dur_val)
-                with c3:
-                    curr_status = str(course_row.get("status") or "published").lower()
-                    status_idx = 0 if curr_status == "published" else 1
-                    status = st.selectbox("Status", options=["published", "draft"], index=status_idx)
+        with c_img:
+            if thumb:
+                st.image(thumb, width=140, caption="")
+            else:
+                st.write("")
 
-                # Teacher selection
-                teacher_ids = list(teacher_options.keys())
-                curr_t_id = course_row.get("teacher_id")
-                curr_t_idx = teacher_ids.index(curr_t_id) if curr_t_id in teacher_ids else 0
+        with c_mid:
+            st.markdown(f"### {title}")
+            st.caption(f"Instructor: {instructor_name}")
+            st.write(f"**{_course_price_pkr(price)}**")
+            st.write(f"**Duration:** {duration} weeks")
+            if description:
+                st.caption(description)
 
-                teacher_id = None
-                if teacher_ids:
-                    selected_teacher_id = st.selectbox(
-                        "Instructor / Teacher",
-                        options=teacher_ids,
-                        index=curr_t_idx,
-                        format_func=lambda tid: teacher_options.get(tid, f"ID {tid}"),
+        with c_right:
+            st.success(badge) if badge == "Published" else st.warning(badge)
+
+            edit_key = f"edit_{course_id}"
+            del_key = f"del_{course_id}"
+
+            if st.button("Edit", key=edit_key):
+                # Simple edit flow: show a form for this course id.
+                with st.form(f"edit_form_{course_id}"):
+                    new_title = st.text_input("Title", value=title)
+                    new_description = st.text_area("Description", value=description)
+                    new_price = st.number_input("Price", min_value=0.0, value=float(price or 0))
+                    new_duration = st.number_input(
+                        "Duration (weeks)", min_value=1, step=1, value=int(duration or 1)
                     )
-                    teacher_id = selected_teacher_id
-                else:
-                    st.info("No teachers found in database. Add a teacher in Faculty Management first.")
+                    new_status = st.selectbox(
+                        "Status", options=["published", "draft"], index=0 if badge == "Published" else 1
+                    )
+                    submitted = st.form_submit_button("Save")
+                if submitted:
+                    payload = {
+                        "title": new_title,
+                        "description": new_description,
+                        "price": new_price,
+                        "duration_weeks": int(new_duration),
+                        "status": new_status,
+                    }
+                    client.table("courses").update(payload).eq("id", course_id).execute()
+                    st.success("Course updated.")
+                    st.rerun()
 
-                uploaded_file = st.file_uploader(
-                    "Upload New Course Image (JPG, PNG, WEBP)",
-                    type=["jpg", "jpeg", "png", "webp"],
-                    key=f"course_edit_file_{pick_id}",
-                )
-                manual_img_url = st.text_input(
-                    "Or Image / Thumbnail URL (Fallback)",
-                    value=current_img,
-                    help="Used if no new file is uploaded.",
-                )
+            if st.button("Delete", key=del_key):
+                client.table("courses").delete().eq("id", course_id).execute()
+                st.success("Course deleted.")
+                st.rerun()
 
-                c_save, c_del = st.columns([1, 1])
-                with c_save:
-                    save = st.form_submit_button("Update Course", type="primary", use_container_width=True)
-                with c_del:
-                    delete = st.form_submit_button("Delete Course", use_container_width=True)
 
-            if save:
-                final_img_url = manual_img_url
-                if uploaded_file is not None:
-                    with st.spinner("Uploading course thumbnail to media bucket..."):
-                        uploaded_url = upload_media(client, uploaded_file, folder="courses")
-                        if uploaded_url:
-                            final_img_url = uploaded_url
+def render_ai_copilot(client):
+    st.subheader("AI Co-Pilot & Subagents")
 
-                update_payload = {
-                    "title": title.strip(),
-                    "description": description.strip() or None,
-                    "category": category.strip() or None,
-                    "price": price,
-                    "duration_weeks": int(duration),
-                    "status": status,
-                    "teacher_id": teacher_id,
-                    "thumbnail_url": final_img_url,
-                    "image_url": final_img_url,
-                }
+    tab_creator, tab_analytics, tab_support = st.tabs(
+        ["Course Content Creator", "Analytics Agent", "Support Lead Assistant"]
+    )
+
+    with tab_creator:
+        topic = st.text_input("Course topic")
+        if st.button("Generate Course JSON", type="primary"):
+            st.session_state["generated_course_json"] = course_content_creator(topic or "")
+
+        gen = st.session_state.get("generated_course_json")
+        if gen:
+            st.json(gen)
+
+            publish = st.button("Publish directly to Supabase", type="secondary")
+            if publish:
                 try:
-                    client.table("courses").update(update_payload).eq("id", pick_id).execute()
-                    st.success("Course updated successfully.")
+                    # Optional: map teacher_id later (left as None).
+                    publish_course_to_supabase(
+                        client=client,
+                        course_json=gen,
+                        teacher_id=None,
+                        status="draft",
+                        image_keyword_to_url=None,
+                    )
+                    st.success("Course published.")
                     st.rerun()
                 except Exception as exc:
-                    # If column like 'category' or 'image_url' doesn't exist, try minimal payload
-                    try:
-                        update_payload.pop("image_url", None)
-                        client.table("courses").update(update_payload).eq("id", pick_id).execute()
-                        st.success("Course updated successfully.")
-                        st.rerun()
-                    except Exception as e2:
-                        try:
-                            update_payload.pop("category", None)
-                            client.table("courses").update(update_payload).eq("id", pick_id).execute()
-                            st.success("Course updated successfully.")
-                            st.rerun()
-                        except Exception as e3:
-                            st.error(f"Failed to update course: {e3}")
+                    st.error(f"Publish failed: {exc}")
 
-            if delete:
-                try:
-                    client.table("courses").delete().eq("id", pick_id).execute()
-                    st.success("Course deleted successfully.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Delete failed: {exc}")
+    with tab_analytics:
+        if st.button("Run Analytics", type="primary"):
+            with st.spinner("Calculating..."):
+                metrics = analytics_agent(client)
+            st.success("Done")
+            st.json(metrics)
 
-    with tab_add:
-        with st.form("add_course_form"):
-            title = st.text_input("Course Title *")
-            description = st.text_area("Description")
-            category = st.text_input("Category", value="Web Development")
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                price = st.number_input("Price ($)", min_value=0.0, step=5.0, value=49.99)
-            with c2:
-                duration = st.number_input("Duration (Weeks)", min_value=1, step=1, value=6)
-            with c3:
-                status = st.selectbox("Status", options=["published", "draft"])
-
-            teacher_ids = list(teacher_options.keys())
-            teacher_id = None
-            if teacher_ids:
-                teacher_id = st.selectbox(
-                    "Assign Teacher",
-                    options=teacher_ids,
-                    format_func=lambda tid: teacher_options.get(tid, f"ID {tid}"),
-                )
-            else:
-                st.caption("No teachers available yet. You can assign one later.")
-
-            uploaded_file = st.file_uploader(
-                "Upload Course Thumbnail (JPG, PNG, WEBP)",
-                type=["jpg", "jpeg", "png", "webp"],
-                key="course_add_file",
-            )
-            fallback_img_url = st.text_input("Or Thumbnail URL (Fallback)")
-
-            submitted = st.form_submit_button("Add Course", type="primary")
-
-        if submitted:
-            if not title.strip():
-                st.warning("Course title is required.")
-            else:
-                final_img_url = fallback_img_url.strip() or None
-                if uploaded_file is not None:
-                    with st.spinner("Uploading course thumbnail to media bucket..."):
-                        uploaded_url = upload_media(client, uploaded_file, folder="courses")
-                        if uploaded_url:
-                            final_img_url = uploaded_url
-
-                insert_payload = {
-                    "title": title.strip(),
-                    "description": description.strip() or None,
-                    "category": category.strip() or None,
-                    "price": price,
-                    "duration_weeks": int(duration),
-                    "status": status,
-                    "teacher_id": teacher_id,
-                    "thumbnail_url": final_img_url,
-                    "image_url": final_img_url,
-                }
-                try:
-                    client.table("courses").insert(insert_payload).execute()
-                    st.success("Course created successfully.")
-                    st.rerun()
-                except Exception as exc:
-                    try:
-                        insert_payload.pop("image_url", None)
-                        client.table("courses").insert(insert_payload).execute()
-                        st.success("Course created successfully.")
-                        st.rerun()
-                    except Exception as e2:
-                        try:
-                            insert_payload.pop("category", None)
-                            client.table("courses").insert(insert_payload).execute()
-                            st.success("Course created successfully.")
-                            st.rerun()
-                        except Exception as e3:
-                            st.error(f"Failed to create course: {e3}")
+    with tab_support:
+        if st.button("Draft Support Replies", type="primary"):
+            with st.spinner("Drafting..."):
+                messages, drafts = support_lead_assistant(client)
+            st.write(f"Messages found: {len(messages)}")
+            st.write("Drafts")
+            for d in drafts:
+                st.markdown(f"**Message ID:** {d.get('id')}\n\n{d.get('reply')}")
 
 
 # ----------------------------------------------------------------------
-# Admissions + push notifications
+# Admissions & Push notifications
+# (kept from existing implementation)
 # ----------------------------------------------------------------------
-
-ADMISSION_STATUSES = ["Pending", "Approved", "Rejected"]
 
 
 def render_admissions(client):
     st.subheader("Admissions & Push Notifications")
 
-    admissions = query(client, "admissions")
+    admissions = query_df(client, "admissions")
     if admissions.empty:
         st.info("No admissions yet.")
     else:
-        edit_cols = ["id", "status"]
-        disabled = [c for c in admissions.columns if c not in edit_cols]
-        orig_map = dict(zip(admissions["id"], admissions["status"]))
+        if "status" in admissions.columns and "id" in admissions.columns:
+            edited = st.data_editor(
+                admissions,
+                use_container_width=True,
+                hide_index=True,
+                disabled=[c for c in admissions.columns if c not in ["id", "status"]],
+                column_config={
+                    "status": st.column_config.SelectboxColumn(
+                        "Status",
+                        options=["Pending", "Approved", "Rejected"],
+                        required=True,
+                    )
+                },
+            )
 
-        edited = st.data_editor(
-            admissions,
-            use_container_width=True,
-            hide_index=True,
-            disabled=disabled,
-            column_config={
-                "status": st.column_config.SelectboxColumn(
-                    "Status", options=ADMISSION_STATUSES, required=True,
-                ),
-            },
-        )
-
-        if st.button("Save status changes", type="primary"):
-            changes = 0
-            for _, r in edited.iterrows():
-                if r["status"] != orig_map.get(r["id"]):
-                    client.table("admissions").update({"status": r["status"]}).eq("id", r["id"]).execute()
-                    changes += 1
-            if changes:
-                st.success(f"{changes} admission(s) updated.")
-            else:
-                st.info("No changes.")
+            if st.button("Save status changes", type="primary"):
+                for _, r in edited.iterrows():
+                    client.table("admissions").update({"status": r["status"]}).eq(
+                        "id", r["id"]
+                    ).execute()
+                st.success("Admissions updated.")
+                st.rerun()
 
     st.divider()
-
-    # ---- Push notifications ----
     st.markdown("#### Broadcast push notification")
-    students = query(client, "profiles")
+
+    students = query_df(client, "profiles")
     if not students.empty and "role" in students.columns:
         students = students[students["role"] == "student"]
 
-    if students.empty:
+    if students.empty or "id" not in students.columns:
         st.info("No student profiles available to notify.")
         return
 
     student_map = students.set_index("id").to_dict("index")
     options = list(student_map.keys())
-
     all_toggle = st.checkbox("Select all students")
     selected = st.multiselect(
         "Recipients",
         options=options,
         default=options if all_toggle else None,
-        format_func=lambda uid: student_map[uid].get("full_name") or student_map[uid].get("email") or uid,
+        format_func=lambda uid: student_map[uid].get("full_name")
+        or student_map[uid].get("email")
+        or str(uid),
     )
 
     with st.form("push_notification"):
         title = st.text_input("Title", placeholder="New course available")
-        message = st.text_area("Message", placeholder="We've launched a new course you might like!")
+        message = st.text_area(
+            "Message", placeholder="We've launched a new course you might like!"
+        )
         push = st.form_submit_button("Send notification", type="primary")
 
     if push:
@@ -649,76 +594,27 @@ def render_admissions(client):
             st.warning("Title is required.")
         else:
             rows = [
-                {"user_id": uid, "title": title.strip(), "message": message.strip(), "is_read": False}
+                {
+                    "user_id": uid,
+                    "title": title.strip(),
+                    "message": message.strip(),
+                    "is_read": False,
+                }
                 for uid in selected
             ]
-            try:
-                client.table("notifications").insert(rows).execute()
-                st.success(f"Notification sent to {len(rows)} student(s).")
-            except Exception as exc:
-                st.error(f"Failed to send notification: {exc}")
+            client.table("notifications").insert(rows).execute()
+            st.success(f"Notification sent to {len(rows)} student(s).")
 
 
 # ----------------------------------------------------------------------
-# App shell
+# Main routing
 # ----------------------------------------------------------------------
+
 
 def main():
-    st.set_page_config(page_title="LearnHub Admin", page_icon="🎓", layout="wide")
-    st.markdown(
-        "<h1 style='margin-bottom:0'>🎓 LearnHub <span style='color:#6366F1'>Admin</span></h1>",
-        unsafe_allow_html=True,
-    )
-
-    # -------------------------
-    # Secure admin login gate
-    # -------------------------
-    ADMIN_USERNAME = st.secrets.get("ADMIN_USERNAME", "aamrosk519@gmail.com")
-    ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "#Suhail#12")
-
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-
-    if not st.session_state["authenticated"]:
-        st.markdown(
-            """
-            <div style='display:flex; justify-content:center; align-items:center; padding-top:40px;'>
-              <div style='width:520px; border:1px solid rgba(255,255,255,0.12); border-radius:12px; padding:24px; background:rgba(255,255,255,0.03);'>
-                <h2 style='margin-bottom:4px;'>Admin Login</h2>
-                <p style='margin-top:0; opacity:0.8;'>Please sign in to access the dashboard.</p>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        with st.form("login_form"):
-            identity = st.text_input("Email / Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login", type="primary")
-
-        if submitted:
-            if identity == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("Invalid email or password")
-
-        st.stop()
-
-    # Logout button when authenticated
-    with st.sidebar:
-        if st.button("Logout", type="secondary"):
-            st.session_state["authenticated"] = False
-            st.rerun()
-
     client = get_supabase()
     if client is None:
         st.stop()
-
-    # -------------------------
-    # Admin modules navigation
-    # -------------------------
 
     menu = st.sidebar.radio(
         "Modules",
@@ -727,6 +623,7 @@ def main():
             "Institute Branding",
             "Faculty Management",
             "Course Management",
+            "AI Co-Pilot & Subagents",
             "Admissions & Notifications",
         ],
     )
@@ -738,11 +635,12 @@ def main():
     elif menu == "Faculty Management":
         render_faculty(client)
     elif menu == "Course Management":
-        render_courses(client)
+        render_courses_horizontal(client)
+    elif menu == "AI Co-Pilot & Subagents":
+        render_ai_copilot(client)
     else:
         render_admissions(client)
 
 
 if __name__ == "__main__":
     main()
-
