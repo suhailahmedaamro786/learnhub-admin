@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #070b14; color: #e5e7eb; font-family: Arial, Helvetica, sans-serif; }
+a { color: inherit; text-decoration: none; }
+.input { width: 100%; border: 1px solid #243047; background: #0d1422; border-radius: 12px; padding: 11px 13px; outline: none; }
+.input:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,.15); }
+.card { border: 1px solid #1e293b; background: rgba(15,23,42,.78); border-radius: 18px; }
