@@ -1,6 +1,8 @@
-import { createServerClient } from '@supabase/ssr';
+import { createServerClient, type CookieOptions } from '@supabase/ssr';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { cookies } from 'next/headers';
+
+type CookieToSet = { name: string; value: string; options: CookieOptions };
 
 export function createClient() {
   const cookieStore = cookies();
@@ -10,7 +12,13 @@ export function createClient() {
   return createServerClient(url, key, {
     cookies: {
       getAll: () => cookieStore.getAll(),
-      setAll(values) { try { values.forEach(({ name, value, options }) => cookieStore.set(name, value, options)); } catch {} },
+      setAll(values: CookieToSet[]) {
+        try {
+          values.forEach(({ name, value, options }) => cookieStore.set(name, value, options));
+        } catch {
+          // Server Components may not allow cookie mutation.
+        }
+      },
     },
   });
 }
