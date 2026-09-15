@@ -1,21 +1,37 @@
-# learnhub-admin
+# LearnHub Admin
 
-Streamlit admin dashboard for LearnHub, backed by Supabase (service-role key,
-server-side only).
+Production-ready Next.js admin dashboard for the LearnHub coaching website. It uses Supabase Auth for sign-in and a **server-only Supabase service-role key** for verified admin operations.
 
-## Run locally
+## Features
+
+- Secure email/password admin login
+- `profiles.role = admin` authorization check
+- Dashboard metrics for students, courses, admissions, teachers and support tickets
+- Course creation and publishing status
+- Faculty overview
+- Admissions review/status workflow
+- Website branding settings
+- Responsive dark admin UI
+- Server-side mutations and cache revalidation
+
+## Local setup
 
 ```bash
-python -m venv venv
-venv\Scripts\activate            # Windows
-pip install -r requirements.txt
-
-# Credentials: env vars OR .streamlit/secrets.toml (copy secrets.toml.example)
-streamlit run app.py
+npm install
+cp .env.example .env.local
+npm run dev
 ```
 
-## Deploy (Streamlit Community Cloud)
+Required variables:
 
-- Main file: `app.py`
-- Python: 3.10–3.12
-- Secrets: paste `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY` — **server only; never prefix with `NEXT_PUBLIC_`**
+
+Create an admin user in Supabase Auth, then make sure its matching `profiles` row has `role = 'admin'`.
+
+## Deploy on Vercel
+
+Set the same three environment variables for Production, Preview and Development as needed. Vercel will run `npm run build` automatically.
+
+> The legacy Streamlit files remain in the repository for reference/backup. The deployed web admin is now the Next.js application at `/dashboard`.
